@@ -1,16 +1,20 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { 
-  LineChart, Line, BarChart, Bar, ScatterChart, Scatter,
-  XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer,
-  Cell, Area, AreaChart
+  Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer,
+  Area, AreaChart, ComposedChart
 } from 'recharts';
 import { 
   Activity, Database, Zap, TrendingUp, DollarSign, Clock,
-  Cpu, HardDrive, ArrowUp, ArrowDown, MapPin, Target,
+  Cpu, ArrowUp, ArrowDown, MapPin, Target,
   PlayCircle, Filter, ChevronRight, Server, Radio
 } from 'lucide-react';
 
-const API_BASE = 'http://localhost:8000';
+const API_BASE = import.meta.env.VITE_API_BASE || 'http://localhost:8000';
+const WS_PATH = '/ws/dashboard';
+const wsUrl = () => {
+  const base = import.meta.env.VITE_WS_BASE || API_BASE.replace(/^http/, 'ws');
+  return `${base}${WS_PATH}`;
+};
 
 // Color palette - Industrial Data Ops theme
 const COLORS = {
@@ -44,12 +48,40 @@ function App() {
   // AI Forecast data
   const [forecastZone, setForecastZone] = useState(161);
   const [forecastHours, setForecastHours] = useState(1);
+  const [modelBundle, setModelBundle] = useState('100');
+  const [bundles, setBundles] = useState(['100', '230', '237']);
   const [prediction, setPrediction] = useState(null);
   const [validationHistory, setValidationHistory] = useState([]);
-  
+  const [validationMetricsByModel, setValidationMetricsByModel] = useState(null);
+  const [wsConnected, setWsConnected] = useState(false);
+  const [dataSource, setDataSource] = useState('');
+  const wsRef = useRef(null);
+
   // System health
   const [clusterHealth, setClusterHealth] = useState(null);
   const [streamingStatus, setStreamingStatus] = useState(null);
+
+  const applyTickPayload = useCallback((m) => {
+    if (m.kpis) setKpis(m.kpis);
+    if (Array.isArray(m.hourlyTrends)) setHourlyTrends(m.hourlyTrends);
+    if (Array.isArray(m.zoneHeatmap)) setZoneHeatmap(m.zoneHeatmap);
+    if (m.prediction !== undefined) setPrediction(m.prediction);
+    if (Array.isArray(m.validationHistory)) setValidationHistory(m.validationHistory);
+    if (m.prediction?.validation_metrics_by_model) {
+      setValidationMetricsByModel(m.prediction.validation_metrics_by_model);
+    }
+    if (m.clusterHealth) setClusterHealth(m.clusterHealth);
+    if (m.streamingStatus) setStreamingStatus(m.streamingStatus);
+    if (m.data_source) setDataSource(m.data_source);
+    if (m.registry?.bundles?.length) setBundles(m.registry.bundles);
+  }, []);
+
+  const sendWsConfig = useCallback(() => {
+    const ws = wsRef.current;
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: 'config', bundle_id: modelBundle, zone_id: forecastZone }));
+    }
+  }, [modelBundle, forecastZone]);
 
   const fetchOverviewData = async () => {
     try {
@@ -70,46 +102,111 @@ function App() {
     }
   };
 
-  const fetchForecastData = async () => {
+  const fetchForecastData = useCallback(async () => {
     try {
+      const qs = new URLSearchParams({
+        bundle_id: modelBundle,
+        zone_id: String(forecastZone),
+      });
       const [validationRes, streamRes] = await Promise.all([
-        fetch(`${API_BASE}/api/forecast/validation-history`),
-        fetch(`${API_BASE}/api/system/streaming-status`)
+        fetch(`${API_BASE}/api/forecast/validation-history?${qs}`),
+        fetch(`${API_BASE}/api/system/streaming-status`),
       ]);
 
-      setValidationHistory((await validationRes.json()).data);
+      const vj = await validationRes.json();
+      setValidationHistory(vj.data || []);
+      setValidationMetricsByModel(vj.validation_metrics_by_model || null);
       setStreamingStatus(await streamRes.json());
     } catch (error) {
       console.error('Forecast fetch error:', error);
     }
-  };
+  }, [forecastZone, modelBundle]);
 
   const runPrediction = async () => {
     try {
       const res = await fetch(
-        `${API_BASE}/api/forecast/predict?zone_id=${forecastZone}&hours_ahead=${forecastHours}`
+        `${API_BASE}/api/forecast/predict?zone_id=${forecastZone}&hours_ahead=${forecastHours}&bundle_id=${modelBundle}`
       );
-      setPrediction(await res.json());
+      const pred = await res.json();
+      setPrediction(pred);
+      if (pred?.validation_metrics_by_model) {
+        setValidationMetricsByModel(pred.validation_metrics_by_model);
+      }
     } catch (error) {
       console.error('Prediction error:', error);
     }
   };
 
   useEffect(() => {
-    fetchOverviewData();
-    fetchForecastData();
-    const interval = setInterval(() => {
-      fetchOverviewData();
-      if (activeTab === 'forecast') fetchForecastData();
-    }, 6000);
-    return () => clearInterval(interval);
-  }, [activeTab]);
+    let reconnectTimer;
+    const connect = () => {
+      const ws = new WebSocket(wsUrl());
+      wsRef.current = ws;
+      ws.onopen = () => {
+        setWsConnected(true);
+        ws.send(JSON.stringify({ type: 'config', bundle_id: modelBundle, zone_id: forecastZone }));
+      };
+      ws.onmessage = (ev) => {
+        try {
+          const m = JSON.parse(ev.data);
+          if (m.type === 'hello') {
+            if (Array.isArray(m.bundles) && m.bundles.length) setBundles(m.bundles);
+            setLoading(false);
+            return;
+          }
+          if (m.type === 'tick') {
+            applyTickPayload(m);
+            setLoading(false);
+          }
+        } catch (e) {
+          console.error('WS parse error', e);
+        }
+      };
+      ws.onerror = () => setWsConnected(false);
+      ws.onclose = () => {
+        setWsConnected(false);
+        reconnectTimer = setTimeout(connect, 3000);
+      };
+    };
+    connect();
+    return () => {
+      clearTimeout(reconnectTimer);
+      if (wsRef.current) {
+        wsRef.current.onclose = null;
+        wsRef.current.close();
+        wsRef.current = null;
+      }
+    };
+  }, [applyTickPayload]);
 
   useEffect(() => {
-    if (activeTab === 'forecast' && !prediction) {
+    sendWsConfig();
+  }, [modelBundle, forecastZone, sendWsConfig]);
+
+  useEffect(() => {
+    if (activeTab === 'forecast') fetchForecastData();
+  }, [activeTab, forecastZone, modelBundle, fetchForecastData]);
+
+  useEffect(() => {
+    const interval = setInterval(() => {
+      if (!wsConnected) {
+        fetchOverviewData();
+        if (activeTab === 'forecast') fetchForecastData();
+      }
+    }, 8000);
+    return () => clearInterval(interval);
+  }, [activeTab, wsConnected, fetchForecastData]);
+
+  useEffect(() => {
+    if (activeTab === 'forecast' && !prediction && !wsConnected) {
       runPrediction();
     }
-  }, [activeTab]);
+  }, [activeTab, prediction, wsConnected, modelBundle, forecastZone, forecastHours]);
+
+  useEffect(() => {
+    const t = setTimeout(() => setLoading(false), 4000);
+    return () => clearTimeout(t);
+  }, []);
 
   const formatNumber = (num) => {
     if (!num) return '0';
@@ -125,6 +222,19 @@ function App() {
       maximumFractionDigits: 0
     }).format(num);
   };
+
+  const perModelMetrics = useMemo(() => {
+    if (
+      prediction &&
+      !prediction.error &&
+      Number(prediction.zone_id) === Number(forecastZone) &&
+      String(prediction.bundle_id) === String(modelBundle) &&
+      prediction.validation_metrics_by_model
+    ) {
+      return prediction.validation_metrics_by_model;
+    }
+    return validationMetricsByModel;
+  }, [prediction, forecastZone, modelBundle, validationMetricsByModel]);
 
   if (loading) {
     return (
@@ -155,6 +265,10 @@ function App() {
               </h1>
               <p className="text-[#64748B] text-xs font-mono uppercase tracking-wider">
                 DATA OPS
+              </p>
+              <p className="text-[10px] font-mono mt-1 text-[#64748B]">
+                WS {wsConnected ? <span className="text-[#00FF88]">LIVE</span> : <span className="text-[#FFB800]">…</span>}
+                {dataSource ? ` · ${dataSource}` : ''}
               </p>
             </div>
           </div>
@@ -195,17 +309,17 @@ function App() {
             <div className="flex items-center gap-2 mb-2">
               <Server size={14} className="text-[#00FF88]" />
               <span className="text-xs font-mono text-[#94A3B8] uppercase">
-                Spark Cluster
+                Silver ingest
               </span>
             </div>
             {clusterHealth && (
               <div className="space-y-1">
                 <div className="flex justify-between text-xs">
-                  <span className="text-[#64748B]">Workers</span>
+                  <span className="text-[#64748B]">Parquet files OK</span>
                   <span className="text-white font-mono">{clusterHealth.active_workers}</span>
                 </div>
                 <div className="flex justify-between text-xs">
-                  <span className="text-[#64748B]">CPU</span>
+                  <span className="text-[#64748B]">Read success</span>
                   <span className="text-[#00FF88] font-mono">{clusterHealth.cpu_utilization_pct}%</span>
                 </div>
               </div>
@@ -231,11 +345,16 @@ function App() {
             setForecastZone={setForecastZone}
             forecastHours={forecastHours}
             setForecastHours={setForecastHours}
+            modelBundle={modelBundle}
+            setModelBundle={setModelBundle}
+            bundles={bundles}
             prediction={prediction}
             validationHistory={validationHistory}
+            perModelMetrics={perModelMetrics}
             streamingStatus={streamingStatus}
             runPrediction={runPrediction}
             formatNumber={formatNumber}
+            formatCurrency={formatCurrency}
           />
         )}
       </div>
@@ -252,12 +371,9 @@ function OverviewTab({ kpis, hourlyTrends, zoneHeatmap, clusterHealth, formatNum
       <div className="bg-[#111827] border-b border-[#1E293B] px-8 py-6">
         <div className="flex items-center justify-between">
           <div>
-            <h2 className="text-2xl font-bold tracking-tight mb-1">
+            <h2 className="text-2xl font-bold tracking-tight">
               Operations Dashboard
             </h2>
-            <p className="text-[#64748B] text-sm font-mono">
-              Real-time aggregation from distributed data mart • Updated every 5s
-            </p>
           </div>
           <div className="flex items-center gap-2 px-4 py-2 bg-[#1A202E] rounded-lg border border-[#00FF88]/20">
             <Radio className="text-[#00FF88] animate-pulse" size={16} />
@@ -272,6 +388,7 @@ function OverviewTab({ kpis, hourlyTrends, zoneHeatmap, clusterHealth, formatNum
           title="Trip Volume"
           value={formatNumber(kpis?.total_trips)}
           change={kpis?.total_trips_change}
+          changeCaption="12–23h vs 0–11h"
           icon={TrendingUp}
           color={COLORS.primary}
           suffix="rides"
@@ -280,6 +397,7 @@ function OverviewTab({ kpis, hourlyTrends, zoneHeatmap, clusterHealth, formatNum
           title="Total Revenue"
           value={formatCurrency(kpis?.total_revenue)}
           change={kpis?.total_revenue_change}
+          changeCaption="12–23h vs 0–11h"
           icon={DollarSign}
           color={COLORS.success}
         />
@@ -305,8 +423,7 @@ function OverviewTab({ kpis, hourlyTrends, zoneHeatmap, clusterHealth, formatNum
         {/* Hourly Trends */}
         <div className="bg-[#111827] rounded-xl border border-[#1E293B] p-6 flex flex-col">
           <div className="mb-4">
-            <h3 className="text-lg font-semibold mb-1">Demand & Revenue by Hour</h3>
-            <p className="text-xs text-[#64748B] font-mono">24-hour rolling window • Spark aggregation</p>
+            <h3 className="text-lg font-semibold">Demand & Revenue by Hour</h3>
           </div>
           <div className="flex-1">
             <ResponsiveContainer width="100%" height="100%">
@@ -372,8 +489,7 @@ function OverviewTab({ kpis, hourlyTrends, zoneHeatmap, clusterHealth, formatNum
         {/* Zone Heatmap */}
         <div className="bg-[#111827] rounded-xl border border-[#1E293B] p-6 flex flex-col">
           <div className="mb-4">
-            <h3 className="text-lg font-semibold mb-1">High-Demand Zones</h3>
-            <p className="text-xs text-[#64748B] font-mono">Top 15 pickup locations • Density map</p>
+            <h3 className="text-lg font-semibold">High-Demand Zones</h3>
           </div>
           <div className="flex-1 overflow-auto">
             <div className="space-y-2">
@@ -414,32 +530,31 @@ function OverviewTab({ kpis, hourlyTrends, zoneHeatmap, clusterHealth, formatNum
 
 function ForecastTab({ 
   forecastZone, setForecastZone, forecastHours, setForecastHours,
-  prediction, validationHistory, streamingStatus, runPrediction, formatNumber 
+  modelBundle, setModelBundle, bundles,
+  prediction, validationHistory, perModelMetrics, streamingStatus,
+  runPrediction, formatNumber, formatCurrency,
 }) {
   const zones = [
     { id: 161, name: "Midtown Center" },
+    { id: 100, name: "Garment District" },
     { id: 230, name: "Times Square" },
+    { id: 237, name: "Upper East Side South" },
     { id: 162, name: "Midtown East" },
     { id: 236, name: "Upper East Side" },
-    { id: 237, name: "Upper East Side South" },
     { id: 79, name: "East Village" },
     { id: 113, name: "Greenwich Village" }
   ];
 
+  const modelRows = perModelMetrics
+    ? ['ensemble', 'lstm', 'xgboost', 'random_forest'].filter((k) => perModelMetrics[k])
+    : [];
+
   return (
     <div className="flex-1 overflow-auto">
-      {/* Header */}
       <div className="bg-[#111827] border-b border-[#1E293B] px-8 py-6">
-        <div className="flex items-center justify-between">
-          <div>
-            <h2 className="text-2xl font-bold tracking-tight mb-1">
-              AI Demand Forecasting
-            </h2>
-            <p className="text-[#64748B] text-sm font-mono">
-              Distributed ML inference • LSTM + XGBoost ensemble
-            </p>
-          </div>
-        </div>
+        <h2 className="text-2xl font-bold tracking-tight">
+          AI Demand Forecasting
+        </h2>
       </div>
 
       {/* Control Panel */}
@@ -457,6 +572,22 @@ function ForecastTab({
             >
               {zones.map(z => (
                 <option key={z.id} value={z.id}>{z.name}</option>
+              ))}
+            </select>
+          </div>
+
+          <div className="flex items-center gap-2">
+            <Cpu size={16} className="text-[#64748B]" />
+            <label className="text-sm text-[#94A3B8] font-mono uppercase tracking-wider">
+              Model bundle
+            </label>
+            <select
+              value={modelBundle}
+              onChange={(e) => setModelBundle(e.target.value)}
+              className="bg-[#1A202E] border border-[#334155] text-white px-3 py-2 rounded-lg text-sm focus:outline-none focus:border-[#00D9FF] max-w-[200px]"
+            >
+              {bundles.map((b) => (
+                <option key={b} value={b}>{b}</option>
               ))}
             </select>
           </div>
@@ -495,13 +626,15 @@ function ForecastTab({
           <h3 className="text-sm font-mono text-[#64748B] uppercase tracking-wider mb-4">
             Ensemble Prediction
           </h3>
-          {prediction ? (
+          {prediction?.error ? (
+            <div className="text-sm text-[#FFB800] font-mono">{prediction.error}</div>
+          ) : prediction?.predictions ? (
             <>
               <div className="mb-6">
                 <div className="text-5xl font-bold bg-gradient-to-r from-[#00D9FF] to-[#00FF88] bg-clip-text text-transparent mb-2">
                   {formatNumber(prediction.predictions.ensemble)}
                 </div>
-                <div className="text-[#94A3B8] text-sm">expected trips</div>
+                <div className="text-[#94A3B8] text-sm">expected trips · bundle {prediction.bundle_id || modelBundle}</div>
               </div>
               
               <div className="space-y-3 pt-4 border-t border-[#1E293B]">
@@ -513,13 +646,37 @@ function ForecastTab({
                   <span className="text-[#64748B]">XGBoost Model</span>
                   <span className="text-white font-mono">{formatNumber(prediction.predictions.xgboost)}</span>
                 </div>
+                <div className="flex justify-between text-sm">
+                  <span className="text-[#64748B]">Random Forest</span>
+                  <span className="text-white font-mono">{formatNumber(prediction.predictions.random_forest)}</span>
+                </div>
+                {prediction.revenue_estimates && (
+                  <div className="pt-3 border-t border-[#1E293B] space-y-2">
+                    <div className="text-[10px] font-mono text-[#64748B] uppercase tracking-wider">Revenue</div>
+                    <div className="flex justify-between text-sm">
+                      <span className="text-[#64748B]">Ensemble</span>
+                      <span className="text-[#FFB800] font-mono">{formatCurrency(prediction.revenue_estimates.ensemble)}</span>
+                    </div>
+                    <div className="flex justify-between text-xs">
+                      <span className="text-[#64748B]">LSTM / XGB / RF</span>
+                      <span className="text-white font-mono text-right leading-tight">
+                        {formatCurrency(prediction.revenue_estimates.lstm)} · {formatCurrency(prediction.revenue_estimates.xgboost)} · {formatCurrency(prediction.revenue_estimates.random_forest)}
+                      </span>
+                    </div>
+                    {prediction.revenue_estimates.avg_revenue_per_trip_window != null && (
+                      <div className="text-[10px] text-[#64748B] font-mono">
+                        Avg $/trip: {prediction.revenue_estimates.avg_revenue_per_trip_window}
+                      </div>
+                    )}
+                  </div>
+                )}
                 <div className="flex justify-between text-sm pt-3 border-t border-[#1E293B]">
                   <span className="text-[#64748B]">Confidence</span>
-                  <span className="text-[#00FF88] font-mono">{(prediction.confidence_score * 100).toFixed(1)}%</span>
+                  <span className="text-[#00FF88] font-mono">{((prediction.confidence_score || 0) * 100).toFixed(1)}%</span>
                 </div>
                 <div className="flex justify-between text-sm">
                   <span className="text-[#64748B]">Inference Time</span>
-                  <span className="text-[#00D9FF] font-mono">{prediction.inference_time_ms.toFixed(0)}ms</span>
+                  <span className="text-[#00D9FF] font-mono">{(prediction.inference_time_ms || 0).toFixed(0)}ms</span>
                 </div>
               </div>
             </>
@@ -536,41 +693,80 @@ function ForecastTab({
           <h3 className="text-sm font-mono text-[#64748B] uppercase tracking-wider mb-4">
             Model Performance
           </h3>
-          {prediction ? (
+          {prediction?.predictions || modelRows.length > 0 ? (
             <div className="space-y-4">
-              <MetricDisplay
-                label="RMSE"
-                value={prediction.model_metrics.rmse.toFixed(2)}
-                unit="trips"
-                color={COLORS.secondary}
-              />
-              <MetricDisplay
-                label="MAE"
-                value={prediction.model_metrics.mae.toFixed(2)}
-                unit="trips"
-                color={COLORS.tertiary}
-              />
-              <MetricDisplay
-                label="R² Score"
-                value={prediction.model_metrics.r2_score.toFixed(3)}
-                color={COLORS.success}
-                isPercentage={false}
-              />
-              <div className="pt-4 border-t border-[#1E293B]">
-                <div className="flex justify-between text-sm mb-2">
-                  <span className="text-[#64748B]">Executor Nodes</span>
-                  <span className="text-white font-mono">{prediction.executor_nodes}</span>
+              {prediction?.predictions && (
+                <>
+                  <MetricDisplay
+                    label="RMSE"
+                    value={(prediction.model_metrics?.rmse ?? 0).toFixed(2)}
+                    unit="trips"
+                    color={COLORS.secondary}
+                  />
+                  <MetricDisplay
+                    label="MAE"
+                    value={(prediction.model_metrics?.mae ?? 0).toFixed(2)}
+                    unit="trips"
+                    color={COLORS.tertiary}
+                  />
+                  <MetricDisplay
+                    label="R² Score"
+                    value={(prediction.model_metrics?.r2_score ?? 0).toFixed(3)}
+                    color={COLORS.success}
+                    isPercentage={false}
+                  />
+                </>
+              )}
+              {modelRows.length > 0 && (
+                <div className={prediction?.predictions ? 'pt-3 border-t border-[#1E293B]' : ''}>
+                  <div className="text-[10px] font-mono text-[#64748B] uppercase tracking-wider mb-2">
+                    By model
+                  </div>
+                  <div className="overflow-x-auto">
+                    <table className="w-full text-xs font-mono">
+                      <thead>
+                        <tr className="text-[#64748B] text-left">
+                          <th className="pb-1 pr-2">Model</th>
+                          <th className="pb-1 pr-2">RMSE</th>
+                          <th className="pb-1 pr-2">MAE</th>
+                          <th className="pb-1">R²</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {modelRows.map((key) => {
+                          const m = perModelMetrics[key];
+                          const label = key === 'random_forest' ? 'RF' : key.charAt(0).toUpperCase() + key.slice(1);
+                          return (
+                            <tr key={key} className="text-white border-t border-[#1E293B]/80">
+                              <td className="py-1 pr-2 text-[#94A3B8]">{label}</td>
+                              <td className="py-1 pr-2">{m.rmse?.toFixed?.(2) ?? m.rmse}</td>
+                              <td className="py-1 pr-2">{m.mae?.toFixed?.(2) ?? m.mae}</td>
+                              <td className="py-1">{m.r2_score?.toFixed?.(3) ?? m.r2_score}</td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
                 </div>
-                <div className="flex justify-between text-sm">
-                  <span className="text-[#64748B]">Target Zone</span>
-                  <span className="text-white font-mono text-xs">{prediction.zone_name}</span>
+              )}
+              {prediction?.predictions && (
+                <div className="pt-4 border-t border-[#1E293B]">
+                  <div className="flex justify-between text-sm mb-2">
+                    <span className="text-[#64748B]">Inference (CPU)</span>
+                    <span className="text-white font-mono">{prediction.executor_nodes}</span>
+                  </div>
+                  <div className="flex justify-between text-sm">
+                    <span className="text-[#64748B]">Target Zone</span>
+                    <span className="text-white font-mono text-xs">{prediction.zone_name}</span>
+                  </div>
                 </div>
-              </div>
+              )}
             </div>
           ) : (
             <div className="text-center py-8 text-[#64748B]">
               <Zap className="mx-auto mb-2" size={32} />
-              <div className="text-sm">Metrics will appear after inference</div>
+              <div className="text-sm">Metrics will appear after validation data loads</div>
             </div>
           )}
         </div>
@@ -578,7 +774,7 @@ function ForecastTab({
         {/* Streaming Status */}
         <div className="bg-[#111827] rounded-xl border border-[#1E293B] p-6">
           <h3 className="text-sm font-mono text-[#64748B] uppercase tracking-wider mb-4">
-            Streaming Pipeline
+            Parquet ingest
           </h3>
           {streamingStatus && (
             <div className="space-y-4">
@@ -589,25 +785,24 @@ function ForecastTab({
               
               <div className="space-y-3">
                 <div className="flex justify-between text-sm">
-                  <span className="text-[#64748B]">Messages/sec</span>
+                  <span className="text-[#64748B]">Rows/sec (ingest)</span>
                   <span className="text-white font-mono">{formatNumber(streamingStatus.messages_per_second)}</span>
                 </div>
                 <div className="flex justify-between text-sm">
-                  <span className="text-[#64748B]">Latency</span>
+                  <span className="text-[#64748B]">Ingest wall time</span>
                   <span className="text-[#00D9FF] font-mono">{streamingStatus.processing_latency_ms}ms</span>
                 </div>
                 <div className="flex justify-between text-sm">
-                  <span className="text-[#64748B]">Offset Lag</span>
+                  <span className="text-[#64748B]">Files skipped</span>
                   <span className="text-[#FFB800] font-mono">{formatNumber(streamingStatus.offset_lag)}</span>
                 </div>
                 <div className="flex justify-between text-sm">
-                  <span className="text-[#64748B]">Batch Interval</span>
+                  <span className="text-[#64748B]">WS tick interval</span>
                   <span className="text-white font-mono">{streamingStatus.batch_interval_seconds}s</span>
                 </div>
               </div>
 
               <div className="pt-4 border-t border-[#1E293B]">
-                <div className="text-xs text-[#64748B] mb-2">Kafka Topics</div>
                 {streamingStatus.kafka_topics.map(topic => (
                   <div key={topic} className="text-xs font-mono text-white bg-[#1A202E] px-2 py-1 rounded mb-1">
                     {topic}
@@ -623,20 +818,28 @@ function ForecastTab({
       <div className="px-8 pb-8">
         <div className="bg-[#111827] rounded-xl border border-[#1E293B] p-6">
           <div className="mb-4">
-            <h3 className="text-lg font-semibold mb-1">Historical Validation</h3>
-            <p className="text-xs text-[#64748B] font-mono">Actual vs Predicted • 24h + forecast window</p>
+            <h3 className="text-lg font-semibold">Historical Validation</h3>
           </div>
-          <ResponsiveContainer width="100%" height={300}>
-            <LineChart data={validationHistory}>
+          <ResponsiveContainer width="100%" height={320}>
+            <ComposedChart data={validationHistory}>
               <CartesianGrid strokeDasharray="3 3" stroke="#1E293B" />
               <XAxis 
                 dataKey="timestamp" 
                 stroke="#64748B"
                 style={{ fontSize: 10, fontFamily: 'monospace' }}
               />
-              <YAxis 
+              <YAxis
+                yAxisId="demand"
                 stroke="#64748B"
                 style={{ fontSize: 10, fontFamily: 'monospace' }}
+                label={{ value: 'Trips', angle: -90, position: 'insideLeft', fill: '#64748B', fontSize: 10 }}
+              />
+              <YAxis
+                yAxisId="revenue"
+                orientation="right"
+                stroke={COLORS.tertiary}
+                style={{ fontSize: 10, fontFamily: 'monospace' }}
+                label={{ value: 'Revenue $', angle: 90, position: 'insideRight', fill: '#64748B', fontSize: 10 }}
               />
               <Tooltip 
                 contentStyle={{ 
@@ -648,23 +851,44 @@ function ForecastTab({
               />
               <Legend />
               <Line 
+                yAxisId="demand"
                 type="monotone"
                 dataKey="actual"
                 stroke={COLORS.primary}
                 strokeWidth={3}
                 dot={false}
-                name="Actual Demand"
+                name="Actual demand"
               />
               <Line 
+                yAxisId="demand"
                 type="monotone"
                 dataKey="predicted"
                 stroke={COLORS.secondary}
                 strokeWidth={2}
                 strokeDasharray="5 5"
                 dot={false}
-                name="Model Prediction"
+                name="Pred. demand (ensemble)"
               />
-            </LineChart>
+              <Line
+                yAxisId="revenue"
+                type="monotone"
+                dataKey="actual_revenue"
+                stroke={COLORS.success}
+                strokeWidth={2}
+                dot={false}
+                name="Actual revenue"
+              />
+              <Line
+                yAxisId="revenue"
+                type="monotone"
+                dataKey="predicted_revenue"
+                stroke={COLORS.tertiary}
+                strokeWidth={2}
+                strokeDasharray="3 3"
+                dot={false}
+                name="Pred. revenue (ensemble)"
+              />
+            </ComposedChart>
           </ResponsiveContainer>
         </div>
       </div>
@@ -672,7 +896,7 @@ function ForecastTab({
   );
 }
 
-function MetricCard({ title, value, change, icon: Icon, color, suffix, small }) {
+function MetricCard({ title, value, change, changeCaption, icon: Icon, color, suffix, small }) {
   return (
     <div className="bg-[#111827] rounded-xl border border-[#1E293B] p-6 hover:border-[#334155] transition-all group">
       <div className="flex items-start justify-between mb-3">
@@ -682,10 +906,15 @@ function MetricCard({ title, value, change, icon: Icon, color, suffix, small }) 
         >
           <Icon size={20} style={{ color }} />
         </div>
-        {change !== undefined && (
-          <div className={`flex items-center gap-1 ${change >= 0 ? 'text-[#00FF88]' : 'text-[#FF3366]'}`}>
-            {change >= 0 ? <ArrowUp size={14} /> : <ArrowDown size={14} />}
-            <span className="text-xs font-mono font-semibold">{Math.abs(change)}%</span>
+        {change !== undefined && change !== null && (
+          <div className="text-right max-w-[140px]">
+            <div className={`flex items-center justify-end gap-1 ${change >= 0 ? 'text-[#00FF88]' : 'text-[#FF3366]'}`}>
+              {change >= 0 ? <ArrowUp size={14} /> : <ArrowDown size={14} />}
+              <span className="text-xs font-mono font-semibold">{Math.abs(change)}%</span>
+            </div>
+            {changeCaption && (
+              <div className="text-[10px] text-[#64748B] font-mono mt-0.5 leading-tight">{changeCaption}</div>
+            )}
           </div>
         )}
       </div>
